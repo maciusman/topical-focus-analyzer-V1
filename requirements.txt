@@ -1,0 +1,11 @@
+requests
+beautifulsoup4
+lxml
+pandas
+numpy==1.26.4 
+scikit-learn==1.4.1
+plotly
+streamlit
+google-generativeai
+python-dotenv
+trafilatura
