@@ -450,10 +450,18 @@ if st.session_state.sitemaps:
             
             # Calculate Metrics
             with st.spinner("Calculating metrics..."):
+                # --- CORRECTED SECTION START ---
+                # Now correctly passing the slider values (focus_k, radius_k)
+                # These correspond to k1 and k2 expected by calculate_metrics
                 results_df, focus_score, radius_score, pairwise_dist_matrix = calculate_metrics(
-                    url_list, processed_paths, coordinates_df, centroid
-                    # k1 and k2 arguments removed as the function no longer uses them
+                    url_list=url_list,
+                    processed_paths=processed_paths,
+                    coordinates_df=coordinates_df,
+                    centroid=centroid,
+                    k1=focus_k,  # Pass the value from the 'Focus Score Scaling' slider
+                    k2=radius_k   # Pass the value from the 'Radius Score Scaling' slider
                 )
+                # --- CORRECTED SECTION END ---
                 
                 # Add content preview column if available
                 if analyze_content and st.session_state.processed_content:
