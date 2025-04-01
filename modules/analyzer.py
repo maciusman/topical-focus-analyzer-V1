@@ -1,27 +1,33 @@
 import pandas as pd
 import numpy as np
-# Use sklearn's pairwise_distances, it's fine
+# Use sklearn's pairwise_distances, it's efficient
 from sklearn.metrics import pairwise_distances
-# Use scipy for pdist/squareform if you prefer for pairwise, but sklearn works
-# from scipy.spatial.distance import pdist, squareform
 import re
 from urllib.parse import urlparse
 
-def calculate_metrics(url_list, processed_paths, coordinates_df, centroid):
+# --- Define epsilon globally as it's used in multiple places ---
+epsilon = 1e-9 # Small value to prevent division by zero or issues with log/powers
+
+# --- CORRECTED calculate_metrics FUNCTION ---
+# Added k1 and k2 arguments with default values matching Streamlit slider defaults
+def calculate_metrics(url_list, processed_paths, coordinates_df, centroid, k1=5.0, k2=5.0):
     """
-    Calculate distances, adaptive focus/radius scores, and pairwise distances.
+    Calculate distances, scaled focus/radius scores, and pairwise distances.
 
     Focus Score: Measures how tightly points cluster around the centroid.
-                 100 = all points at centroid, 0 = average point is as far as the furthest point.
-    Radius Score: Measures how far the furthest point is relative to the overall diameter
-                  of the point cloud. 100 = furthest point defines the max extent,
-                  0 = all points at centroid.
+                 Scaled by k1. Higher k1 makes the score more sensitive (drops faster with distance).
+                 100 = perfect focus, lower values = less focus.
+    Radius Score: Measures how far the furthest point is relative to the overall diameter.
+                  Scaled by k2. Higher k2 makes the score more sensitive to spread.
+                  Reflects the extent of topic coverage.
 
     Args:
         url_list (list): Original URL list
         processed_paths (list): Processed paths from the URLs
         coordinates_df (pd.DataFrame): DataFrame with 'x' and 'y' columns (2D coordinates)
         centroid (tuple): (centroid_x, centroid_y) coordinates of the 2D points
+        k1 (float): Scaling factor for Focus Score calculation. Default is 5.0.
+        k2 (float): Scaling factor for Radius Score calculation. Default is 5.0.
 
     Returns:
         tuple: (final DataFrame, focus score, radius score, pairwise distance matrix)
@@ -49,40 +55,45 @@ def calculate_metrics(url_list, processed_paths, coordinates_df, centroid):
 
     # --- Pairwise Distances and Max Spread ---
     pairwise_dist_matrix = np.array([[0.0]]) # Default for single point
-    max_pairwise_dist = 0.0 # Default for single point
+    max_pairwise_dist = 0.0 # Default for single point (diameter)
 
     if num_points > 1:
         points = coordinates_df[['x', 'y']].values
         pairwise_dist_matrix = pairwise_distances(points)
         # Find the maximum distance between any two points (diameter of the cloud)
-        # Exclude the diagonal (distance from a point to itself)
         if pairwise_dist_matrix.size > 1:
              max_pairwise_dist = np.max(pairwise_dist_matrix)
 
-    # --- Adaptive Score Calculation ---
-    epsilon = 1e-9 # Small value to prevent division by zero
+    # --- Scaled Score Calculation using k1 and k2 ---
 
-    # Focus Score Calculation:
-    # Compare average distance to the maximum distance from the centroid.
+    # Focus Score Calculation: Uses average distance relative to max distance, scaled by k1.
+    # Higher k1 means score drops faster as average distance increases relative to max.
     if max_distance_from_centroid < epsilon:
         # If max distance is ~0, all points are at the centroid, perfect focus.
         focus_score = 100.0
     else:
         # Normalized average distance (0 to 1). Closer to 0 means more focused.
         normalized_avg_dist = avg_distance / (max_distance_from_centroid + epsilon)
-        # Invert and scale to 0-100.
-        focus_score = 100.0 * (1.0 - normalized_avg_dist)
+        # Use k1 in an exponential way: makes the score more sensitive for higher k1.
+        # (1 - normalized_avg_dist) is high (near 1) for focused sites. Raising to power k1 keeps it high.
+        # If less focused (normalized_avg_dist > 0), (1 - norm...) is < 1, power k1 reduces it faster.
+        # Divide k1 by its default 5.0 to moderate the scaling effect across the slider range [1, 20]
+        focus_score = 100.0 * (1.0 - normalized_avg_dist)**(k1 / 5.0)
 
-    # Radius Score Calculation:
-    # Compare the max distance from the centroid to the overall max pairwise distance (diameter).
+    # Radius Score Calculation: Uses max distance from centroid relative to diameter, scaled by k2.
+    # Higher k2 makes score rise faster as max distance approaches diameter.
     if max_pairwise_dist < epsilon:
-         # If the max pairwise distance is ~0, all points are identical, no radius.
+        # If the max pairwise distance is ~0, all points are identical, effectively zero radius.
         radius_score = 0.0
     else:
-        # How much of the total diameter is covered by the distance from the centroid?
-        radius_score = 100.0 * (max_distance_from_centroid / (max_pairwise_dist + epsilon))
+        # Ratio of max distance from centroid to the total diameter (0 to 1)
+        radius_ratio = max_distance_from_centroid / (max_pairwise_dist + epsilon)
+        # Use k2 in an exponential growth formula: makes score approach 100 faster for higher k2.
+        # (1 - exp(-ratio * k2)) increases from 0 towards 1 as ratio*k2 increases.
+        # Divide k2 by its default 5.0 to moderate the scaling effect across the slider range [1, 20]
+        radius_score = 100.0 * (1.0 - np.exp(-radius_ratio * (k2 / 5.0)))
 
-    # Clamp scores to the valid range [0, 100] just in case of floating point nuances
+    # Clamp scores to the valid range [0, 100]
     focus_score = max(0.0, min(100.0, focus_score))
     radius_score = max(0.0, min(100.0, radius_score))
 
@@ -91,13 +102,18 @@ def calculate_metrics(url_list, processed_paths, coordinates_df, centroid):
     result_df['page_depth'] = result_df['url'].apply(get_page_depth)
 
     # Final DataFrame contains all URL data and metrics
+    # Reorder columns for slightly better readability if desired
+    final_cols = ['url', 'processed_path', 'page_type', 'page_depth', 'x', 'y', 'distance_from_centroid']
+    # Ensure all expected columns exist before reordering
+    final_cols = [col for col in final_cols if col in result_df.columns]
+    result_df = result_df[final_cols]
+
     return result_df, focus_score, radius_score, pairwise_dist_matrix
 
 # --- Helper Functions (identify_page_type, get_page_depth) remain the same ---
 def identify_page_type(url):
     """
     Identify the likely page type based on URL patterns.
-    (Code is identical to previous version - kept for completeness)
     """
     url_lower = url.lower()
     path = urlparse(url).path.lower()
@@ -135,7 +151,6 @@ def identify_page_type(url):
 def get_page_depth(url):
     """
     Calculate the depth of a page (number of directory levels).
-    (Code is identical to previous version - kept for completeness)
     """
     path = urlparse(url).path
     # Remove potential filename at the end before splitting
@@ -146,66 +161,50 @@ def get_page_depth(url):
     return len(segments)
 
 
-# --- find_potential_duplicates function remains the same ---
+# --- find_potential_duplicates function remains the same, uses global epsilon ---
 def find_potential_duplicates(result_df, pairwise_dist_matrix, threshold=1.0):
     """
     Find potential duplicate content based on URL proximity in vector space.
-    (Code is mostly identical - small print fix)
     """
     duplicates = []
     n = len(result_df)
 
-    if n <= 1 or pairwise_dist_matrix is None or pairwise_dist_matrix.size == 0:
-         print("Not enough data points or invalid distance matrix to find duplicates.")
-         return duplicates
+    # Check if enough data and valid matrix
+    if n <= 1 or pairwise_dist_matrix is None or pairwise_dist_matrix.shape != (n, n):
+        # Optionally print a warning or log this
+        # print("Warning: Not enough data points or invalid distance matrix to find duplicates.")
+        return duplicates
 
-    # Debug info
-    print(f"\n--- Duplicate Analysis ---")
-    print(f"Matrix shape: {pairwise_dist_matrix.shape}, Num points: {n}")
-    print(f"Distance threshold: {threshold}")
+    # Use numpy indexing for efficiency
+    # Find indices where distance is between epsilon (non-zero) and the threshold
+    # Use np.triu_indices to avoid duplicate pairs (i,j) and (j,i) and self-pairs (i,i)
+    indices_upper_triangle = np.triu_indices(n, k=1)
+    distances_upper_triangle = pairwise_dist_matrix[indices_upper_triangle]
 
-    # Calculate some stats about the distance matrix
-    non_zero_distances = pairwise_dist_matrix[np.triu_indices(n, k=1)] # Upper triangle excluding diagonal
-    if len(non_zero_distances) > 0:
-        print(f"Min non-zero pairwise distance: {non_zero_distances.min():.4f}")
-        print(f"Max pairwise distance: {non_zero_distances.max():.4f}")
-        print(f"Mean pairwise distance: {non_zero_distances.mean():.4f}")
-    else:
-        print("Warning: All pairwise distances are zero!")
+    # Filter these distances by the threshold
+    close_pairs_indices = np.where((distances_upper_triangle > epsilon) & (distances_upper_triangle < threshold))[0]
 
-    # Find duplicate candidates
-    indices = np.where((pairwise_dist_matrix > epsilon) & (pairwise_dist_matrix < threshold)) # Use epsilon
-    # indices will contain pairs, need to map them back correctly
-    idx_pairs = list(zip(indices[0], indices[1]))
-    # Filter to avoid duplicates (i, j) and (j, i), only keep i < j
-    unique_pairs = set()
-    for i, j in idx_pairs:
-        if i < j:
-             unique_pairs.add((i,j))
+    # Get the original row/column indices for these close pairs
+    row_indices = indices_upper_triangle[0][close_pairs_indices]
+    col_indices = indices_upper_triangle[1][close_pairs_indices]
 
-    for i, j in unique_pairs:
-         path1 = result_df.iloc[i]['processed_path']
-         path2 = result_df.iloc[j]['processed_path']
-         # Optional: Check if paths are different to reduce noise if desired
-         # if path1 != path2:
-         duplicates.append({
-                'url1': result_df.iloc[i]['url'],
-                'url2': result_df.iloc[j]['url'],
-                'distance': pairwise_dist_matrix[i, j],
-                'path1': path1,
-                'path2': path2
-            })
-
+    # Build the list of duplicates
+    for i, j in zip(row_indices, col_indices):
+        duplicates.append({
+            'url1': result_df.iloc[i]['url'],
+            'url2': result_df.iloc[j]['url'],
+            'distance': pairwise_dist_matrix[i, j],
+            'path1': result_df.iloc[i]['processed_path'],
+            'path2': result_df.iloc[j]['processed_path']
+        })
 
     # Sort by distance (closest pairs first)
     duplicates.sort(key=lambda x: x['distance'])
 
-    print(f"Found {len(duplicates)} potential duplicate pairs below threshold {threshold}")
-    print(f"--- End Duplicate Analysis ---")
     return duplicates
 
 
-# --- test_analyzer function (Updated to use new logic) ---
+# --- test_analyzer function (Updated to use new logic and pass k1, k2) ---
 def test_analyzer():
     # Sample data
     urls = [
@@ -247,10 +246,14 @@ def test_analyzer():
     centroid = coordinates.mean(axis=0)
     print(f"Data Centroid: ({centroid[0]:.2f}, {centroid[1]:.2f})")
 
-
     # --- Calculate metrics using the UPDATED function ---
+    # Pass example k1, k2 values (e.g., the defaults)
+    test_k1 = 5.0
+    test_k2 = 5.0
+    print(f"\n--- Running Test with k1={test_k1}, k2={test_k2} ---") # Add info line
+
     result_df, focus_score, radius_score, pairwise_dist_matrix = calculate_metrics(
-        urls, processed_paths, coordinates_df, centroid
+        urls, processed_paths, coordinates_df, centroid, k1=test_k1, k2=test_k2
     )
 
     print("\nResult DataFrame:")
@@ -269,8 +272,17 @@ def test_analyzer():
     else:
         print("  No potential duplicates found below the threshold.")
 
-# Add a global epsilon if needed by find_potential_duplicates outside the main func
-epsilon = 1e-9
+    # --- Test with different k values ---
+    test_k1_high = 15.0
+    test_k2_low = 2.0
+    print(f"\n--- Running Test with k1={test_k1_high}, k2={test_k2_low} ---")
+
+    result_df_2, focus_score_2, radius_score_2, _ = calculate_metrics(
+        urls, processed_paths, coordinates_df, centroid, k1=test_k1_high, k2=test_k2_low
+    )
+    print(f"\nFocus Score (High k1): {focus_score_2:.2f}/100")
+    print(f"Radius Score (Low k2): {radius_score_2:.2f}/100")
+
 
 if __name__ == "__main__":
     test_analyzer()
